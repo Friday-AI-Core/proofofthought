@@ -1,5 +1,7 @@
 """ProofOfThought: Main API for Z3-based reasoning."""
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -61,7 +63,7 @@ class ProofOfThought:
         optimize_timeout: int = 100000,
         cache_dir: str | None = None,
         z3_path: str = "z3",
-        postprocessors: Sequence[str | "Postprocessor"] | None = None,
+        postprocessors: Sequence[str | Postprocessor] | None = None,
         postprocessor_configs: dict[str, dict] | None = None,
     ) -> None:
         """Initialize ProofOfThought.
@@ -119,9 +121,9 @@ class ProofOfThought:
 
     def _initialize_postprocessors(
         self,
-        postprocessors: Sequence[str | "Postprocessor"],
+        postprocessors: Sequence[str | Postprocessor],
         configs: dict[str, dict],
-    ) -> list["Postprocessor"]:
+    ) -> list[Postprocessor]:
         """Initialize postprocessor instances from names or objects.
 
         Args:

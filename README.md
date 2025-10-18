@@ -9,15 +9,116 @@
 
 LLM-based reasoning using Z3 theorem proving with multiple backend support (SMT2 and JSON).
 
+## Features
+
+- **Dual Backend Support**: Choose between SMT2 (default) or JSON execution backends
+- **Azure OpenAI Integration**: Native support for Azure GPT-4o and GPT-5 models
+- **Comprehensive Benchmarks**: Evaluated on 5 reasoning datasets (ProntoQA, FOLIO, ProofWriter, ConditionalQA, StrategyQA)
+- **High-level API**: Simple Python interface for reasoning tasks
+- **Batch Evaluation Pipeline**: Built-in tools for dataset evaluation and metrics
+- **Postprocessing Techniques**: Self-Refine, Self-Consistency, Decomposed Prompting, and Least-to-Most Prompting for enhanced reasoning quality
+
+## Installation
+
+### From PyPI (Recommended)
+
+Install the latest stable version:
+
+```bash
+pip install proofofthought
+```
+
+**Note:** Package name is `proofofthought`, but imports use `z3adapter`:
+```python
+from z3adapter.reasoning import ProofOfThought
+```
+
+### From Source (Development)
+
+For contributing or using the latest development version:
+
+```bash
+git clone https://github.com/debarghaG/proofofthought.git
+cd proofofthought
+pip install -r requirements.txt
+```
+
+### Prerequisites
+
+- Python 3.12 or higher
+- An OpenAI API key or Azure OpenAI endpoint
+- Z3 solver (automatically installed via `z3-solver` package)
+
+## Setup
+
+### Environment Variables
+
+Create a `.env` file in your project directory:
+
+**For OpenAI:**
+```bash
+OPENAI_API_KEY=your-api-key-here
+```
+
+**For Azure OpenAI:**
+```bash
+AZURE_OPENAI_ENDPOINT=https://your-endpoint.openai.azure.com/
+AZURE_OPENAI_KEY=your-azure-key-here
+AZURE_DEPLOYMENT_NAME=gpt-5  # or gpt-4o
+AZURE_API_VERSION=2024-02-15-preview
+```
+
+You can also set these as system environment variables instead of using a `.env` file.
+
 ## Quick Start
 
+### Using OpenAI
+
 ```python
+import os
+from dotenv import load_dotenv
 from openai import OpenAI
 from z3adapter.reasoning import ProofOfThought
 
-client = OpenAI(api_key="...")
-pot = ProofOfThought(llm_client=client)
+# Load environment variables
+load_dotenv()
 
+# Create OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize ProofOfThought
+pot = ProofOfThought(llm_client=client, model="gpt-4o")
+
+# Ask a question
+result = pot.query("Would Nancy Pelosi publicly denounce abortion?")
+print(result.answer)  # False
+```
+
+### Using Azure OpenAI
+
+```python
+import os
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from z3adapter.reasoning import ProofOfThought
+
+# Load environment variables
+load_dotenv()
+
+# Create Azure OpenAI client
+client = AzureOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    api_version=os.getenv("AZURE_API_VERSION")
+)
+
+# Initialize ProofOfThought with your deployment name
+pot = ProofOfThought(
+    llm_client=client,
+    model=os.getenv("AZURE_DEPLOYMENT_NAME")  # e.g., "gpt-4o" or "gpt-5"
+)
+
+# Ask a question
 result = pot.query("Would Nancy Pelosi publicly denounce abortion?")
 print(result.answer)  # False
 ```
@@ -36,21 +137,6 @@ result = evaluator.evaluate(
 )
 print(f"Accuracy: {result.metrics.accuracy:.2%}")
 ```
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
-
-## Features
-
-- **Dual Backend Support**: Choose between SMT2 (default) or JSON execution backends
-- **Azure OpenAI Integration**: Native support for Azure GPT-4o and GPT-5 models
-- **Comprehensive Benchmarks**: Evaluated on 5 reasoning datasets (ProntoQA, FOLIO, ProofWriter, ConditionalQA, StrategyQA)
-- **High-level API**: Simple Python interface for reasoning tasks
-- **Batch Evaluation Pipeline**: Built-in tools for dataset evaluation and metrics
-- **Postprocessing Techniques**: Self-Refine, Self-Consistency, Decomposed Prompting, and Least-to-Most Prompting for enhanced reasoning quality
 
 ## Backend Selection
 
@@ -111,20 +197,28 @@ Most users should use the high-level API.
 
 ## Examples
 
-See `examples/` directory for complete examples including Azure OpenAI support.
+The `examples/` directory contains complete working examples for various use cases:
 
-**Note:** Examples should be run from the project root directory:
+- **simple_usage.py** - Basic usage with OpenAI
+- **azure_simple_example.py** - Simple Azure OpenAI integration
+- **backend_comparison.py** - Comparing SMT2 vs JSON backends
+- **batch_evaluation.py** - Evaluating on datasets
+- **postprocessor_example.py** - Using postprocessing techniques
+
+### Running Examples After pip Install
+
+If you installed via `pip install proofofthought`, you can create your own scripts anywhere using the Quick Start examples above. The examples directory is primarily for development and testing.
+
+### Running Examples in Development Mode
+
+If you cloned the repository:
 
 ```bash
 cd /path/to/proofofthought
 python examples/simple_usage.py
 ```
 
-For Azure examples that use `azure_config`, the helper module is located at `utils/azure_config.py`. When running from the project root with `PYTHONPATH` set correctly, examples can import it directly:
-
-```python
-from utils.azure_config import get_client_config
-```
+**Note:** Some examples use helper modules like `utils/azure_config.py` which are only available when running from the repository root.
 
 ## Running Experiments
 
