@@ -1,9 +1,7 @@
 """Self-Consistency postprocessor for improving answer reliability.
-
 Based on the Self-Consistency technique from:
 "Self-Consistency Improves Chain of Thought Reasoning in Language Models" (Wang et al., 2022)
 """
-
 import json
 import logging
 import os
@@ -23,19 +21,19 @@ logger = logging.getLogger(__name__)
 
 class SelfConsistency(Postprocessor):
     """Self-Consistency postprocessor using majority voting.
-
+    
     The Self-Consistency technique works by:
     1. Generating multiple independent reasoning paths
     2. Collecting answers from all paths
     3. Selecting the most consistent answer via majority voting
-
+    
     This increases reliability by reducing the impact of random errors
     or spurious reasoning in any single attempt.
     """
 
     def __init__(self, num_samples: int = 5, name: str | None = None):
         """Initialize Self-Consistency postprocessor.
-
+        
         Args:
             num_samples: Number of independent samples to generate
             name: Optional custom name for this postprocessor
@@ -53,88 +51,68 @@ class SelfConsistency(Postprocessor):
         **kwargs: Any,
     ) -> "QueryResult":
         """Apply Self-Consistency to improve answer reliability.
-
+        
         Args:
             question: Original question
             initial_result: Initial QueryResult
             generator: Program generator
             backend: Execution backend
-            llm_client: LLM client
-            **kwargs: Additional arguments (cache_dir, temperature, max_tokens)
-
+            llm_client: LLM client for generation
+            **kwargs: Additional arguments
+            
         Returns:
-            QueryResult with most consistent answer
+            QueryResult with the most consistent answer
         """
-        logger.info(
-            f"[{self.name}] Starting self-consistency with {self.num_samples} samples "
-            f"(including initial result)"
-        )
-
-        cache_dir = kwargs.get("cache_dir", tempfile.gettempdir())
-        temperature = kwargs.get("temperature", 0.7)  # Higher temp for diversity
-        max_tokens = kwargs.get("max_tokens", 16384)
-
-        # Collect all results (including initial)
+        logger.info(f"[{self.name}] Starting self-consistency with {self.num_samples} samples")
+        
+        # Collect all samples including the initial result
         all_results = [initial_result]
-        answer_counts: Counter[bool | None] = Counter()
-
-        # Count initial result
-        if initial_result.success and initial_result.answer is not None:
-            answer_counts[initial_result.answer] += 1
-
+        
         # Generate additional samples
-        num_additional = self.num_samples - 1
-        for i in range(num_additional):
-            logger.info(f"[{self.name}] Generating sample {i+2}/{self.num_samples}")
-
-            sample_result = self._generate_sample(
-                question=question,
-                generator=generator,
-                backend=backend,
-                cache_dir=cache_dir,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-            all_results.append(sample_result)
-
-            if sample_result.success and sample_result.answer is not None:
-                answer_counts[sample_result.answer] += 1
-                logger.info(f"[{self.name}] Sample {i+2} answer: {sample_result.answer}")
-            else:
-                logger.warning(f"[{self.name}] Sample {i+2} failed")
-
-        # Perform majority voting
-        if not answer_counts:
-            logger.warning(f"[{self.name}] No successful samples, returning initial result")
+        for i in range(self.num_samples - 1):
+            logger.info(f"[{self.name}] Generating sample {i + 2}/{self.num_samples}")
+            try:
+                sample_result = self._generate_sample(
+                    question, generator, backend, llm_client, **kwargs
+                )
+                all_results.append(sample_result)
+            except Exception as e:
+                logger.error(f"[{self.name}] Failed to generate sample {i + 2}: {e}")
+        
+        # Filter successful results with valid answers
+        valid_results = [
+            r for r in all_results 
+            if r.success and r.answer is not None
+        ]
+        
+        if not valid_results:
+            logger.warning(f"[{self.name}] No valid results found, returning initial result")
             return initial_result
-
-        # Find most common answer
-        majority_answer, count = answer_counts.most_common(1)[0]
-        total_successful = sum(answer_counts.values())
-
-        logger.info(
-            f"[{self.name}] Majority vote: {majority_answer} "
-            f"({count}/{total_successful} samples, "
-            f"{count/total_successful:.1%} agreement)"
+        
+        # Aggregate answers and select the most consistent one
+        answer_counts = Counter(r.answer for r in valid_results)
+        most_common_answers = answer_counts.most_common()
+        
+        logger.info(f"[{self.name}] Answer distribution: {dict(answer_counts)}")
+        
+        # Handle tie-breaking with confidence-based selection
+        if len(most_common_answers) > 1 and most_common_answers[0][1] == most_common_answers[1][1]:
+            # Tie detected - select based on result quality metrics
+            logger.info(f"[{self.name}] Tie detected, using confidence-based tie-breaking")
+            tied_answer = self._break_tie(valid_results, most_common_answers)
+        else:
+            tied_answer = most_common_answers[0][0]
+        
+        # Find the best result with the most consistent answer
+        best_result = self._select_best_result(
+            [r for r in valid_results if r.answer == tied_answer]
         )
-
-        # Find the best result with the majority answer
-        best_result = initial_result
-        for result in all_results:
-            if result.success and result.answer == majority_answer:
-                # Prefer results with fewer attempts or clearer SAT/UNSAT counts
-                if best_result.answer != majority_answer or self._is_better_result(
-                    result, best_result
-                ):
-                    best_result = result
-
-        # Add metadata about consistency
+        
         logger.info(
-            f"[{self.name}] Self-consistency complete. "
-            f"Answer distribution: {dict(answer_counts)}"
+            f"[{self.name}] Selected answer '{best_result.answer}' "
+            f"(appeared {answer_counts[best_result.answer]}/{len(valid_results)} times)"
         )
-
+        
         return best_result
 
     def _generate_sample(
@@ -142,34 +120,26 @@ class SelfConsistency(Postprocessor):
         question: str,
         generator: "Z3ProgramGenerator",
         backend: "Backend",
-        cache_dir: str,
-        temperature: float,
-        max_tokens: int,
+        llm_client: Any,
+        **kwargs: Any,
     ) -> "QueryResult":
-        """Generate a single independent sample.
-
+        """Generate a single sample result.
+        
         Args:
-            question: Original question
+            question: Question to answer
             generator: Program generator
             backend: Execution backend
-            cache_dir: Cache directory
-            temperature: LLM temperature (higher for diversity)
-            max_tokens: Max tokens
-
+            llm_client: LLM client
+            **kwargs: Additional arguments
+            
         Returns:
-            QueryResult from this sample
+            QueryResult for this sample
         """
-        from z3adapter.reasoning.proof_of_thought import QueryResult
-
         try:
-            # Generate new program with higher temperature for diversity
-            gen_result = generator.generate(
-                question=question,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-            if not gen_result.success or gen_result.program is None:
+            # Generate Z3 program
+            gen_result = generator.generate(question, llm_client)
+            
+            if not gen_result.success or not gen_result.json_program:
                 return QueryResult(
                     question=question,
                     answer=None,
@@ -179,34 +149,11 @@ class SelfConsistency(Postprocessor):
                     output="",
                     success=False,
                     num_attempts=0,
-                    error="Failed to generate program",
                 )
-
-            # Save and execute program
-            file_extension = backend.get_file_extension()
-            temp_file = tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=file_extension,
-                dir=cache_dir,
-                delete=False,
-            )
-            program_path = temp_file.name
-
-            with open(program_path, "w") as f:
-                if generator.backend == "json":
-                    json.dump(gen_result.program, f, indent=2)
-                else:
-                    f.write(gen_result.program)  # type: ignore
-
-            # Execute program
-            verify_result = backend.execute(program_path)
-
-            # Clean up temp file
-            try:
-                os.unlink(program_path)
-            except Exception:
-                pass
-
+            
+            # Execute the program
+            verify_result = backend.verify(gen_result.json_program)
+            
             return QueryResult(
                 question=question,
                 answer=verify_result.answer,
@@ -217,7 +164,6 @@ class SelfConsistency(Postprocessor):
                 success=verify_result.success and verify_result.answer is not None,
                 num_attempts=1,
             )
-
         except Exception as e:
             logger.error(f"[{self.name}] Error generating sample: {e}")
             return QueryResult(
@@ -232,24 +178,69 @@ class SelfConsistency(Postprocessor):
                 error=str(e),
             )
 
-    def _is_better_result(self, result1: "QueryResult", result2: "QueryResult") -> bool:
-        """Compare two results to determine which is better.
-
+    def _break_tie(
+        self,
+        valid_results: list["QueryResult"],
+        tied_answers: list[tuple[Any, int]],
+    ) -> Any:
+        """Break ties between equally frequent answers using confidence metrics.
+        
         Args:
-            result1: First result
-            result2: Second result
-
+            valid_results: All valid results
+            tied_answers: List of (answer, count) tuples with equal counts
+            
         Returns:
-            True if result1 is better than result2
+            The answer selected after tie-breaking
         """
-        # Prefer results with fewer attempts (cleaner generation)
-        if result1.num_attempts < result2.num_attempts:
-            return True
-        if result1.num_attempts > result2.num_attempts:
-            return False
+        # Get all answers that are tied for most common
+        max_count = tied_answers[0][1]
+        tied_answer_values = [ans for ans, count in tied_answers if count == max_count]
+        
+        # Calculate average confidence metrics for each tied answer
+        answer_metrics = {}
+        for answer in tied_answer_values:
+            matching_results = [r for r in valid_results if r.answer == answer]
+            
+            # Use SAT/UNSAT clarity as a confidence metric
+            # Higher clarity = more confident answer
+            avg_clarity = sum(
+                abs(r.sat_count - r.unsat_count) for r in matching_results
+            ) / len(matching_results)
+            
+            # Prefer results with fewer attempts (cleaner generation)
+            avg_attempts = sum(r.num_attempts for r in matching_results) / len(matching_results)
+            
+            # Combined score: higher clarity is better, fewer attempts is better
+            answer_metrics[answer] = (avg_clarity, -avg_attempts)
+        
+        # Select answer with best metrics
+        best_answer = max(answer_metrics, key=answer_metrics.get)
+        logger.info(f"[{self.name}] Tie-breaking metrics: {answer_metrics}")
+        
+        return best_answer
 
-        # Prefer results with clearer SAT/UNSAT distinction
-        result1_clarity = abs(result1.sat_count - result1.unsat_count)
-        result2_clarity = abs(result2.sat_count - result2.unsat_count)
-
-        return result1_clarity > result2_clarity
+    def _select_best_result(
+        self,
+        matching_results: list["QueryResult"],
+    ) -> "QueryResult":
+        """Select the best result from a list of results with the same answer.
+        
+        Args:
+            matching_results: Results with the same answer
+            
+        Returns:
+            The best QueryResult based on quality metrics
+        """
+        if not matching_results:
+            raise ValueError("No matching results to select from")
+        
+        # Sort by quality: prefer cleaner generation (fewer attempts) and clearer SAT/UNSAT
+        best_result = max(
+            matching_results,
+            key=lambda r: (
+                -r.num_attempts,  # Fewer attempts is better (negative for max)
+                abs(r.sat_count - r.unsat_count),  # Higher clarity is better
+            )
+        )
+        
+        return best_result
