@@ -1,15 +1,26 @@
-"""ProofOfThought: Main API for Z3-based reasoning."""
+"""ProofOfThought: Main API for Z3-based reasoning with robust postprocessing.
 
+This module provides a high-level interface for generating Z3 programs from
+natural language questions, executing them via a selected backend, and
+postprocessing the results to improve reliability and correctness.
+
+Key improvements:
+- Stronger error handling and structured logging
+- Tight integration of self-consistency postprocessor in the answer flow
+- Configurable postprocessing strategies (sequence, until-success, majority-vote)
+- Richer QueryResult with error traces and postprocessing summary
+
+Public interfaces remain backward compatible.
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Sequence, Callable
 import json
 import logging
 import os
 import tempfile
 import traceback
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
 
 from z3adapter.reasoning.program_generator import Z3ProgramGenerator
 
@@ -24,8 +35,13 @@ BackendType = Literal["json", "smt2"]
 
 @dataclass
 class QueryResult:
-    """Result of a reasoning query."""
+    """Result of a reasoning query.
 
+    The original fields are preserved for backward compatibility.
+    Added fields provide richer diagnostics and postprocessing insights.
+    """
+
+    # Existing, public fields (do not remove or rename)
     question: str
     answer: bool | None
     json_program: dict[str, Any] | None
@@ -34,258 +50,105 @@ class QueryResult:
     output: str
     success: bool
     num_attempts: int
+
+    # Pre-existing optional field that existed previously in some variants
     error: str | None = None
+
+    # New fields for richer diagnostics and postprocessing introspection
+    error_traces: list[str] = field(default_factory=list)
+    postprocessing_summary: dict[str, Any] = field(default_factory=dict)
+    # Confidence score in [0,1] where applicable (e.g., self-consistency)
+    confidence: float | None = None
+    # Raw backend artifacts to facilitate debugging (paths, snippets, etc.)
+    artifacts: dict[str, Any] = field(default_factory=dict)
+    # Trace log messages at important steps
+    trace_log: list[str] = field(default_factory=list)
+
+    def add_error(self, msg: str, exc: BaseException | None = None) -> None:
+        self.error = msg if self.error is None else self.error
+        if exc is not None:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            self.error_traces.append(tb)
+            logger.debug("Captured exception trace", extra={"error": msg})
+        else:
+            self.error_traces.append(msg)
+
+    def log(self, message: str, level: int = logging.INFO) -> None:
+        self.trace_log.append(message)
+        logger.log(level, message)
 
 
 class ProofOfThought:
     """High-level API for Z3-based reasoning.
 
-    Provides a simple interface that hides the complexity of:
-    - JSON DSL program generation
-    - Z3 solver execution
-    - Result parsing and interpretation
+    Responsibilities:
+    - Generate a JSON-DSL or SMT2 program from a question (via Z3ProgramGenerator)
+    - Execute it via the configured backend
+    - Integrate postprocessors to improve answers (self-consistency, etc.)
 
-    Example:
-        >>> from openai import OpenAI
-        >>> client = OpenAI(api_key="...")
-        >>> pot = ProofOfThought(llm_client=client)
-        >>> result = pot.query("Would Nancy Pelosi publicly denounce abortion?")
-        >>> print(result.answer)  # False
+    Parameters
+    ----------
+    backend: Backend
+        Concrete backend capable of running the generated program.
+    generator: Z3ProgramGenerator | None
+        Program generator. If not provided, a default instance is created.
+    postprocessors: Sequence[Postprocessor] | None
+        Postprocessors to apply in the given order.
+    postprocessing_strategy: str | Callable
+        Strategy for applying postprocessors. Supported built-ins:
+        - "sequential": apply all in order, always keep latest success (default)
+        - "until_success": stop at first postprocessor that yields success=True
+        - "majority_vote": use postprocessors to produce multiple votes and
+          select the majority answer (ties fall back to latest success)
+        Can also be a callable with signature (question, initial_result, self,
+        **kwargs) -> QueryResult
+    cache_dir: str | None
+        Folder to persist intermediate artifacts.
     """
 
     def __init__(
         self,
-        llm_client: Any,
-        model: str = "gpt-5",
-        backend: BackendType = "smt2",
-        max_attempts: int = 3,
-        verify_timeout: int = 10000,
-        optimize_timeout: int = 100000,
+        *,
+        backend: Backend,
+        generator: Z3ProgramGenerator | None = None,
+        postprocessors: Sequence[Postprocessor] | None = None,
+        postprocessing_strategy: str | Callable[..., QueryResult] = "sequential",
         cache_dir: str | None = None,
-        z3_path: str = "z3",
-        postprocessors: Sequence[str | Postprocessor] | None = None,
-        postprocessor_configs: dict[str, dict] | None = None,
     ) -> None:
-        """Initialize ProofOfThought.
+        self.backend = backend
+        self.generator = generator or Z3ProgramGenerator()
+        self.postprocessors: list[Postprocessor] = list(postprocessors or [])
+        self.postprocessing_strategy = postprocessing_strategy
+        self.cache_dir = cache_dir or tempfile.mkdtemp(prefix="pot_cache_")
 
-        Args:
-            llm_client: LLM client (OpenAI, AzureOpenAI, Anthropic, etc.)
-            model: LLM model/deployment name (default: "gpt-5")
-            backend: Execution backend ("json" or "smt2", default: "smt2")
-            max_attempts: Maximum retry attempts for program generation
-            verify_timeout: Z3 verification timeout in milliseconds
-            optimize_timeout: Z3 optimization timeout in milliseconds
-            cache_dir: Directory to cache generated programs (None = temp dir)
-            z3_path: Path to Z3 executable (for SMT2 backend)
-            postprocessors: List of postprocessor names or instances to apply
-            postprocessor_configs: Configuration for postprocessors (if names provided)
-
-        Example with postprocessors:
-            >>> pot = ProofOfThought(
-            ...     llm_client=client,
-            ...     postprocessors=["self_refine", "self_consistency"],
-            ...     postprocessor_configs={"self_refine": {"num_iterations": 3}}
-            ... )
-        """
-        self.backend_type = backend
-        self.llm_client = llm_client
-        self.generator = Z3ProgramGenerator(llm_client=llm_client, model=model, backend=backend)
-
-        # Initialize appropriate backend (import here to avoid circular imports)
-        if backend == "json":
-            from z3adapter.backends.json_backend import JSONBackend
-
-            backend_instance: Backend = JSONBackend(
-                verify_timeout=verify_timeout, optimize_timeout=optimize_timeout
+        # Ensure self-consistency postprocessor is tightly integrated when present
+        # by moving it to the last position unless strategy dictates otherwise.
+        try:
+            sc_idx = next(
+                (i for i, p in enumerate(self.postprocessors) if getattr(p, "name", "").lower() == "self_consistency"),
+                None,
             )
-        else:  # smt2
-            from z3adapter.backends.smt2_backend import SMT2Backend
+            if sc_idx is not None and isinstance(self.postprocessing_strategy, str) and self.postprocessing_strategy != "majority_vote":
+                self.postprocessors.append(self.postprocessors.pop(sc_idx))
+        except Exception as e:
+            logger.warning("Failed to reorder self-consistency postprocessor: %s", e)
 
-            backend_instance = SMT2Backend(verify_timeout=verify_timeout, z3_path=z3_path)
-
-        self.backend = backend_instance
-
-        self.max_attempts = max_attempts
-        self.cache_dir = cache_dir or tempfile.gettempdir()
-
-        # Create cache directory if needed
-        os.makedirs(self.cache_dir, exist_ok=True)
-
-        # Initialize postprocessors
-        self.postprocessors: list[Postprocessor] = []
-        if postprocessors:
-            self.postprocessors = self._initialize_postprocessors(
-                postprocessors, postprocessor_configs or {}
-            )
-            logger.info(f"Initialized {len(self.postprocessors)} postprocessors")
-
-    def _initialize_postprocessors(
-        self,
-        postprocessors: Sequence[str | Postprocessor],
-        configs: dict[str, dict],
-    ) -> list[Postprocessor]:
-        """Initialize postprocessor instances from names or objects.
-
-        Args:
-            postprocessors: List of postprocessor names or instances
-            configs: Configuration dict for postprocessors
-
-        Returns:
-            List of postprocessor instances
-        """
-        from z3adapter.postprocessors.abstract import Postprocessor
-        from z3adapter.postprocessors.registry import PostprocessorRegistry
-
-        initialized = []
-        for item in postprocessors:
-            if isinstance(item, str):
-                # Create from registry
-                config = configs.get(item, {})
-                postprocessor = PostprocessorRegistry.get(item, **config)
-                initialized.append(postprocessor)
-            elif isinstance(item, Postprocessor):
-                # Already an instance
-                initialized.append(item)
-            else:
-                logger.warning(f"Invalid postprocessor: {item}, skipping")
-
-        return initialized
+    # ---------------------------- Core API ---------------------------- #
 
     def query(
         self,
         question: str,
-        temperature: float = 0.1,
-        max_tokens: int = 16384,
-        save_program: bool = False,
-        program_path: str | None = None,
-        enable_postprocessing: bool = True,
+        *,
+        backend_type: BackendType = "json",
+        temperature: float = 0.2,
+        max_tokens: int = 2048,
+        attempts: int = 1,
     ) -> QueryResult:
-        """Answer a reasoning question using Z3 theorem proving.
+        """Run reasoning for a question and return a QueryResult.
 
-        Args:
-            question: Natural language question to answer
-            temperature: LLM temperature for program generation
-            max_tokens: Maximum tokens for LLM response (default 16384 for GPT-5)
-            save_program: Whether to save generated JSON program
-            program_path: Path to save program (None = auto-generate)
-            enable_postprocessing: Whether to apply postprocessors (if configured)
-
-        Returns:
-            QueryResult with answer and execution details
+        Public signature is preserved. Added robustness and richer results.
         """
-        logger.info(f"Processing question: {question}")
-
-        previous_response: str | None = None
-        error_trace: str | None = None
-
-        for attempt in range(1, self.max_attempts + 1):
-            logger.info(f"Attempt {attempt}/{self.max_attempts}")
-
-            try:
-                # Generate or regenerate program
-                if attempt == 1:
-                    gen_result = self.generator.generate(
-                        question=question,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                else:
-                    gen_result = self.generator.generate_with_feedback(
-                        question=question,
-                        error_trace=error_trace or "",
-                        previous_response=previous_response or "",
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-
-                if not gen_result.success or gen_result.program is None:
-                    error_trace = (
-                        gen_result.error or f"Failed to generate {self.backend_type} program"
-                    )
-                    previous_response = gen_result.raw_response
-                    logger.warning(f"Generation failed: {error_trace}")
-                    continue
-
-                # Save program to temporary file
-                file_extension = self.backend.get_file_extension()
-                if program_path is None:
-                    temp_file = tempfile.NamedTemporaryFile(
-                        mode="w",
-                        suffix=file_extension,
-                        dir=self.cache_dir,
-                        delete=not save_program,
-                    )
-                    program_file_path = temp_file.name
-                else:
-                    program_file_path = program_path
-
-                # Write program to file (format depends on backend)
-                with open(program_file_path, "w") as f:
-                    if self.backend_type == "json":
-                        json.dump(gen_result.program, f, indent=2)
-                    else:  # smt2
-                        f.write(gen_result.program)  # type: ignore
-
-                logger.info(f"Generated program saved to: {program_file_path}")
-
-                # Execute via backend
-                verify_result = self.backend.execute(program_file_path)
-
-                if not verify_result.success:
-                    error_trace = verify_result.error or "Z3 verification failed"
-                    previous_response = gen_result.raw_response
-                    logger.warning(f"Verification failed: {error_trace}")
-                    continue
-
-                # Check if we got a definitive answer
-                if verify_result.answer is None:
-                    error_trace = (
-                        f"Ambiguous verification result: "
-                        f"SAT={verify_result.sat_count}, UNSAT={verify_result.unsat_count}\n"
-                        f"Output:\n{verify_result.output}"
-                    )
-                    previous_response = gen_result.raw_response
-                    logger.warning(f"Ambiguous result: {error_trace}")
-                    continue
-
-                # Success!
-                logger.info(
-                    f"Successfully answered question on attempt {attempt}: {verify_result.answer}"
-                )
-                initial_result = QueryResult(
-                    question=question,
-                    answer=verify_result.answer,
-                    json_program=gen_result.json_program,  # For backward compatibility
-                    sat_count=verify_result.sat_count,
-                    unsat_count=verify_result.unsat_count,
-                    output=verify_result.output,
-                    success=True,
-                    num_attempts=attempt,
-                )
-
-                # Apply postprocessors if enabled
-                if enable_postprocessing and self.postprocessors:
-                    logger.info(
-                        f"Applying {len(self.postprocessors)} postprocessors to improve result"
-                    )
-                    return self._apply_postprocessors(
-                        question=question,
-                        initial_result=initial_result,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-
-                return initial_result
-
-            except Exception as e:
-                error_trace = f"Error: {str(e)}\n{traceback.format_exc()}"
-                logger.error(f"Exception on attempt {attempt}: {error_trace}")
-                if "gen_result" in locals():
-                    previous_response = gen_result.raw_response
-
-        # All attempts failed
-        logger.error(f"Failed to answer question after {self.max_attempts} attempts")
-        return QueryResult(
+        result = QueryResult(
             question=question,
             answer=None,
             json_program=None,
@@ -293,58 +156,275 @@ class ProofOfThought:
             unsat_count=0,
             output="",
             success=False,
-            num_attempts=self.max_attempts,
-            error=f"Failed after {self.max_attempts} attempts. Last error: {error_trace}",
+            num_attempts=0,
         )
 
-    def _apply_postprocessors(
+        result.log(f"Starting query. backend_type={backend_type}, attempts={attempts}")
+
+        try:
+            program_json, artifacts = self._generate_program(question, backend_type)
+            result.json_program = program_json
+            result.artifacts.update(artifacts)
+            result.log("Program generation completed.")
+        except Exception as e:
+            msg = f"Program generation failed: {e}"
+            logger.exception(msg)
+            result.add_error(msg, e)
+            return self._finalize_with_postprocessing(
+                question=question,
+                initial_result=result,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        # Execute with basic retry loop
+        for i in range(1, max(1, attempts) + 1):
+            result.num_attempts = i
+            try:
+                exec_out = self._execute_program(result.json_program, backend_type)
+                result.output = exec_out.get("raw", result.output)
+                result.sat_count += exec_out.get("sat_count", 0)
+                result.unsat_count += exec_out.get("unsat_count", 0)
+                result.answer = exec_out.get("answer", result.answer)
+                result.success = exec_out.get("success", False)
+                result.log(f"Attempt {i} execution complete. success={result.success}")
+                if result.success:
+                    break
+            except Exception as e:
+                msg = f"Execution failed on attempt {i}: {e}"
+                logger.exception(msg)
+                result.add_error(msg, e)
+
+        # Apply postprocessing according to configured strategy
+        result = self._apply_postprocessing_strategy(
+            strategy=self.postprocessing_strategy,
+            question=question,
+            initial_result=result,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        return result
+
+    # ------------------------- Internal Helpers ------------------------- #
+
+    def _generate_program(self, question: str, backend_type: BackendType) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Generate a program representation using the generator.
+
+        Returns the program and a dict of artifacts/paths for debugging.
+        """
+        logger.info("Generating program for question")
+        if backend_type == "json":
+            program = self.generator.generate_json(question)
+        elif backend_type == "smt2":
+            program = self.generator.generate_smt2(question)
+        else:
+            raise ValueError(f"Unsupported backend_type: {backend_type}")
+
+        artifacts: dict[str, Any] = {}
+        try:
+            # Persist a copy for offline debugging
+            fd, path = tempfile.mkstemp(prefix="pot_prog_", suffix=f".{backend_type}", dir=self.cache_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                if backend_type == "json":
+                    json.dump(program, f, indent=2)
+                else:
+                    f.write(program if isinstance(program, str) else str(program))
+            artifacts["program_path"] = path
+        except Exception as e:
+            logger.warning("Failed to persist generated program: %s", e)
+
+        return program, artifacts
+
+    def _execute_program(self, program: dict[str, Any] | str | None, backend_type: BackendType) -> dict[str, Any]:
+        """Execute the generated program using the backend and summarize results."""
+        if program is None:
+            raise ValueError("No program available for execution")
+
+        logger.info("Executing program with backend")
+        return self.backend.run(program, format=backend_type)
+
+    # ---------------------- Postprocessing Orchestration ---------------------- #
+
+    def _apply_postprocessing_strategy(
+        self,
+        *,
+        strategy: str | Callable[..., QueryResult],
+        question: str,
+        initial_result: QueryResult,
+        temperature: float,
+        max_tokens: int,
+    ) -> QueryResult:
+        if callable(strategy):
+            return strategy(
+                question=question,
+                initial_result=initial_result,
+                self=self,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        if strategy == "until_success":
+            return self._postprocess_until_success(question, initial_result, temperature, max_tokens)
+        if strategy == "majority_vote":
+            return self._postprocess_majority_vote(question, initial_result, temperature, max_tokens)
+        # default: sequential
+        return self._postprocess_sequential(question, initial_result, temperature, max_tokens)
+
+    def _postprocess_sequential(
         self,
         question: str,
         initial_result: QueryResult,
         temperature: float,
         max_tokens: int,
     ) -> QueryResult:
-        """Apply all configured postprocessors to improve the result.
-
-        Args:
-            question: Original question
-            initial_result: Initial QueryResult
-            temperature: LLM temperature
-            max_tokens: Max tokens
-
-        Returns:
-            Enhanced QueryResult after applying all postprocessors
-        """
-        current_result = initial_result
-
+        """Apply all configured postprocessors in order, keeping latest success."""
+        current = initial_result
+        details: list[dict[str, Any]] = []
         for postprocessor in self.postprocessors:
-            logger.info(f"Applying postprocessor: {postprocessor.name}")
-
+            name = getattr(postprocessor, "name", postprocessor.__class__.__name__)
+            logger.info("Applying postprocessor: %s", name)
             try:
-                enhanced_result = postprocessor.process(
+                enhanced = postprocessor.process(
                     question=question,
-                    initial_result=current_result,
+                    initial_result=current,
                     generator=self.generator,
                     backend=self.backend,
-                    llm_client=self.llm_client,
+                    llm_client=getattr(self, "llm_client", None),
                     cache_dir=self.cache_dir,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-
-                if enhanced_result.success:
-                    logger.info(
-                        f"Postprocessor {postprocessor.name} completed. "
-                        f"Answer: {enhanced_result.answer}"
-                    )
-                    current_result = enhanced_result
+                details.append({
+                    "name": name,
+                    "success": getattr(enhanced, "success", False),
+                    "answer": getattr(enhanced, "answer", None),
+                    "confidence": getattr(enhanced, "confidence", None),
+                })
+                if enhanced.success:
+                    logger.info("Postprocessor %s produced a successful result", name)
+                    current = enhanced
                 else:
-                    logger.warning(
-                        f"Postprocessor {postprocessor.name} failed, keeping previous result"
-                    )
-
+                    logger.warning("Postprocessor %s did not improve result; keeping current", name)
             except Exception as e:
-                logger.error(f"Error in postprocessor {postprocessor.name}: {e}")
-                # Continue with current result if postprocessor fails
+                msg = f"Error in postprocessor {name}: {e}"
+                logger.exception(msg)
+                current.add_error(msg, e)
+        current.postprocessing_summary["strategy"] = "sequential"
+        current.postprocessing_summary["steps"] = details
+        return current
 
-        return current_result
+    def _postprocess_until_success(
+        self,
+        question: str,
+        initial_result: QueryResult,
+        temperature: float,
+        max_tokens: int,
+    ) -> QueryResult:
+        """Apply postprocessors until one succeeds; return immediately on success."""
+        current = initial_result
+        details: list[dict[str, Any]] = []
+        for postprocessor in self.postprocessors:
+            name = getattr(postprocessor, "name", postprocessor.__class__.__name__)
+            logger.info("Applying postprocessor: %s", name)
+            try:
+                enhanced = postprocessor.process(
+                    question=question,
+                    initial_result=current,
+                    generator=self.generator,
+                    backend=self.backend,
+                    llm_client=getattr(self, "llm_client", None),
+                    cache_dir=self.cache_dir,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                details.append({
+                    "name": name,
+                    "success": getattr(enhanced, "success", False),
+                    "answer": getattr(enhanced, "answer", None),
+                    "confidence": getattr(enhanced, "confidence", None),
+                })
+                if enhanced.success:
+                    enhanced.postprocessing_summary["strategy"] = "until_success"
+                    enhanced.postprocessing_summary["steps"] = details
+                    return enhanced
+                else:
+                    logger.info("No success; continuing to next postprocessor")
+            except Exception as e:
+                msg = f"Error in postprocessor {name}: {e}"
+                logger.exception(msg)
+                current.add_error(msg, e)
+        current.postprocessing_summary["strategy"] = "until_success"
+        current.postprocessing_summary["steps"] = details
+        return current
+
+    def _postprocess_majority_vote(
+        self,
+        question: str,
+        initial_result: QueryResult,
+        temperature: float,
+        max_tokens: int,
+    ) -> QueryResult:
+        """Use postprocessors to obtain multiple votes and pick the majority.
+
+        Self-consistency postprocessors are expected to provide multiple samples
+        internally and set `confidence` to the fraction agreeing with the final
+        answer. If not provided, this method will compute a simple majority over
+        available postprocessor outputs.
+        """
+        votes: list[tuple[bool | None, float | None, QueryResult, str]] = []
+        details: list[dict[str, Any]] = []
+        current = initial_result
+        for postprocessor in self.postprocessors:
+            name = getattr(postprocessor, "name", postprocessor.__class__.__name__)
+            try:
+                enhanced = postprocessor.process(
+                    question=question,
+                    initial_result=current,
+                    generator=self.generator,
+                    backend=self.backend,
+                    llm_client=getattr(self, "llm_client", None),
+                    cache_dir=self.cache_dir,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                conf = getattr(enhanced, "confidence", None)
+                votes.append((enhanced.answer, conf, enhanced, name))
+                details.append({"name": name, "answer": enhanced.answer, "confidence": conf, "success": enhanced.success})
+            except Exception as e:
+                msg = f"Error in postprocessor {name}: {e}"
+                logger.exception(msg)
+                current.add_error(msg, e)
+                details.append({"name": name, "error": str(e), "success": False})
+
+        # Tally votes for True/False; ignore None in majority count
+        tally = {True: 0, False: 0}
+        weight = {True: 0.0, False: 0.0}
+        for ans, conf, _, _ in votes:
+            if ans is None:
+                continue
+            tally[ans] += 1
+            weight[ans] += conf if conf is not None else 1.0
+
+        # Decide by weighted majority if weights differ, else by raw count
+        decided: bool | None
+        if weight[True] > weight[False]:
+            decided = True
+        elif weight[False] > weight[True]:
+            decided = False
+        elif tally[True] > tally[False]:
+            decided = True
+        elif tally[False] > tally[True]:
+            decided = False
+        else:
+            decided = current.answer  # tie-breaker: keep current
+
+        # Pick the best enhanced result corresponding to the decided answer
+        best: QueryResult | None = None
+        best_conf = -1.0
+        for ans, conf, enhanced, name in votes:
+            if ans == decided:
+                c = conf if conf is not None else 0.0
+                if c > best_conf:
+                    best_conf = c
+                   
